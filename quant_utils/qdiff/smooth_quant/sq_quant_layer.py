@@ -36,6 +36,9 @@ class SQQuantizedLinear(QuantizedLinear):
     def update_quantized_weight_scaled(self):
         assert self.channel_mask is not None
         C_out, C_in = self.fp_module.weight.shape
+        device = self.fp_module.weight.device
+        if self.channel_mask.device != device:
+            self.channel_mask = self.channel_mask.to(device)
         #print(f"init={self.weight.data[0]}")
         self.w_quantizer.init_done = False
         self.weight.data = self.w_quantizer(self.fp_module.weight / self.channel_mask.reshape([1, C_in]))

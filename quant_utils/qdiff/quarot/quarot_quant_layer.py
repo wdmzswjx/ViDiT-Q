@@ -25,11 +25,15 @@ class QuarotQuantizedLinear(QuantizedLinear):
         self.rotation_matrix = None   # init so could be load in quant_params
 
     def get_rotation_matrix(self):
-        self.rotation_matrix = random_hadamard_matrix(self.in_features, "cuda")
+        device = self.fp_module.weight.device
+        self.rotation_matrix = random_hadamard_matrix(self.in_features, device)
 
     def update_quantized_weight_rotated(self):
+        device = self.fp_module.weight.device
+        if self.rotation_matrix.device != device:
+            self.rotation_matrix = self.rotation_matrix.to(device)
         self.w_quantizer.init_done = False   # unset the init done to overwrite quant_params
-        self.weight.data = self.w_quantizer(torch.matmul(self.fp_module.weight.data.double(), self.rotation_matrix).float())
+        self.weight.data = self.w_quantizer(torch.matmul(self.fp_module.weight.data.to(device).double(), self.rotation_matrix).float())
         self.w_quantizer.init_done = True
 
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:

@@ -35,17 +35,26 @@ class ViDiTQuantizedLinear(QuantizedLinear):
         assert not torch.isnan(channel_mask.any()), "nan exists in channel mask"
             
     def get_rotation_matrix(self):
-        self.rotation_matrix = random_hadamard_matrix(self.in_features, "cuda")
+        device = self.fp_module.weight.device
+        self.rotation_matrix = random_hadamard_matrix(self.in_features, device)
 
     def update_quantized_weight_rotated_and_scaled(self):
-        
+
         # INFO: apply the scaling first, the apply rotation
         assert self.channel_mask is not None
         C_out, C_in = self.fp_module.weight.shape
+        device = self.fp_module.weight.device
+
+        # Ensure channel_mask and rotation_matrix are on the same device as weight
+        if self.channel_mask.device != device:
+            self.channel_mask = self.channel_mask.to(device)
+        if self.rotation_matrix.device != device:
+            self.rotation_matrix = self.rotation_matrix.to(device)
+
         self.w_quantizer.init_done = False   # unset the init done to overwrite quant_params
 
         self.weight.data = self.w_quantizer(self.fp_module.weight / self.channel_mask.reshape([1, C_in]))
-        self.weight.data = self.w_quantizer(torch.matmul(self.weight.data.double(), self.rotation_matrix).float())
+        self.weight.data = self.w_quantizer(torch.matmul(self.weight.data.to(device).double(), self.rotation_matrix).float())
         
         self.w_quantizer.init_done = True
 
