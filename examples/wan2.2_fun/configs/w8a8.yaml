@@ -1,0 +1,33 @@
+# ViDiT-Q W8A8 quantization config for Wan2.2-Fun
+# Basic 8-bit weight and 8-bit activation quantization
+
+model:
+    model_id: "wan2.2_fun"
+    model_type: 'wan'
+
+# Layers to keep in full precision (FP16/BF16)
+# - patch_embedding: Conv3d input embedding, not nn.Linear
+# - text_embedding: text projection layers (important for quality)
+# - time_embedding/time_projection: timestep conditioning
+# - head: output projection layer
+# - img_emb: CLIP image embedding projection (for i2v mode)
+# - modulation: nn.Parameter, not nn.Linear (auto-skipped)
+# - norm: RMSNorm/LayerNorm weight params (auto-skipped)
+remain_fp_regex: text_embedding|time_embedding|time_projection|head|img_emb
+
+# ViDiT-Q: apply rotation + channel scaling to later blocks
+# Wan2.2-Fun 14B has 40 blocks; apply ViDiT-Q to blocks 30-39
+# Wan2.2-Fun 1.3B has 30 blocks; apply ViDiT-Q to blocks 22-29
+viditq:
+  alpha: 0.75
+  layer_name_regex: blocks\.3[0-9]|blocks\.2[2-9]
+
+calib_data:
+  save_path: ./calib_data.pth
+
+weight:
+  n_bits: 8
+  sym: False
+act:
+  n_bits: 8
+  sym: True

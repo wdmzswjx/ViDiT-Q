@@ -1,0 +1,38 @@
+# ViDiT-Q W4A8 Mixed Precision config for Wan2.2-Fun
+# 4-bit weight, 8-bit activation with mixed precision per layer
+
+model:
+    model_id: "wan2.2_fun"
+    model_type: 'wan'
+
+# Layers to keep in full precision
+remain_fp_regex: text_embedding|time_embedding|time_projection|head|img_emb
+
+# Mixed precision assignment:
+# layer_name_regex: [FP16_regex, W8/A8_regex(default), W4/A4_regex, W2/A2_regex]
+# - FP16: embedding layers, head, conditioning layers
+# - W8A8: default for most layers
+# - W4A8: self_attn and cross_attn projections (q, k, v, o) in later blocks
+# - W2: FFN layers in later blocks (more compressible)
+mixed_precision:
+  weight:
+    layer_name_regex: ['text_embedding|time_embedding|time_projection|head|img_emb|cross_attn','','blocks\.3[0-9]|blocks\.2[2-9]','ffn']
+  act:
+    layer_name_regex: ['text_embedding|time_embedding|time_projection|head|img_emb|cross_attn','','blocks\.3[0-9]|blocks\.2[2-9]','']
+
+# ViDiT-Q: apply to later blocks for better quality
+viditq:
+  alpha: 0.5665
+  layer_name_regex: blocks\.3[0-9]|blocks\.2[2-9]
+
+calib_data:
+  save_path: ./calib_data.pth
+
+weight:
+  n_bits: [2,4,8]
+  i_bitwidth: 2
+  sym: False
+act:
+  n_bits: [2,4,8]
+  i_bitwidth: 2
+  sym: True
