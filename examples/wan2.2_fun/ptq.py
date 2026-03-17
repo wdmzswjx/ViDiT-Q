@@ -125,9 +125,10 @@ def main(args):
         """Initialize SmoothQuant channel masks from calibration data."""
         from qdiff.smooth_quant.sq_quant_layer import SQQuantizedLinear
         assert isinstance(module, SQQuantizedLinear)
-        act_mask = calib_data[full_name].max(dim=0)[0]  # [T, C] -> [C]
+        weight_device = module.fp_module.weight.device
+        act_mask = calib_data[full_name].max(dim=0)[0].to(weight_device)  # [T, C] -> [C]
         zero_mask = act_mask < 1e-3
-        act_mask = torch.where(zero_mask, torch.tensor(1e-3), act_mask)
+        act_mask = torch.where(zero_mask, torch.tensor(1e-3, device=weight_device), act_mask)
         module.get_channel_mask(act_mask)
         module.update_quantized_weight_scaled()
 
@@ -142,9 +143,10 @@ def main(args):
         """Initialize ViDiT-Q (rotation + channel scaling) from calibration data."""
         from qdiff.viditq.viditq_quant_layer import ViDiTQuantizedLinear
         assert isinstance(module, ViDiTQuantizedLinear)
-        act_mask = calib_data[full_name].max(dim=0)[0]  # [T, C] -> [C]
+        weight_device = module.fp_module.weight.device
+        act_mask = calib_data[full_name].max(dim=0)[0].to(weight_device)  # [T, C] -> [C]
         zero_mask = act_mask < 1e-3
-        act_mask = torch.where(zero_mask, torch.tensor(1e-3), act_mask)
+        act_mask = torch.where(zero_mask, torch.tensor(1e-3, device=weight_device), act_mask)
         module.get_channel_mask(act_mask)
         module.get_rotation_matrix()
         module.update_quantized_weight_rotated_and_scaled()
