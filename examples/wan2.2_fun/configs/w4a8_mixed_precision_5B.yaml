@@ -1,0 +1,38 @@
+# ViDiT-Q W4A8 Mixed Precision config for Wan2.2-Fun (5B dense model)
+# Wan2.2-5B: dim=3072, num_layers=30, num_heads=24, ffn_dim=14336
+
+model:
+    model_id: "wan2.2_fun_5B"
+    model_type: 'wan'
+
+# Layers to keep in full precision
+remain_fp_regex: text_embedding|time_embedding|time_projection|head|img_emb
+
+# Mixed precision assignment for 5B (30 layers):
+# [FP16, W8A8(default), W4A8, W2]
+# - FP16: embedding/conditioning/cross_attn layers
+# - W8A8: default for early blocks (0-21)
+# - W4A8: later blocks 22-29 (attn projections)
+# - W2: FFN in later blocks
+mixed_precision:
+  weight:
+    layer_name_regex: ['text_embedding|time_embedding|time_projection|head|img_emb|cross_attn','','blocks\.2[2-9]','ffn']
+  act:
+    layer_name_regex: ['text_embedding|time_embedding|time_projection|head|img_emb|cross_attn','','blocks\.2[2-9]','']
+
+# ViDiT-Q for later blocks
+viditq:
+  alpha: 0.5665
+  layer_name_regex: blocks\.2[2-9]
+
+calib_data:
+  save_path: ./calib_data.pth
+
+weight:
+  n_bits: [2,4,8]
+  i_bitwidth: 2
+  sym: False
+act:
+  n_bits: [2,4,8]
+  i_bitwidth: 2
+  sym: True

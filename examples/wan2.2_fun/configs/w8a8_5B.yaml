@@ -1,0 +1,30 @@
+# ViDiT-Q W8A8 quantization config for Wan2.2-Fun (5B dense model)
+# Wan2.2-5B: dim=3072, num_layers=30, num_heads=24, ffn_dim=14336
+
+model:
+    model_id: "wan2.2_fun_5B"
+    model_type: 'wan'
+
+# Layers to keep in full precision (FP16/BF16)
+# - text_embedding: text projection layers
+# - time_embedding/time_projection: timestep conditioning
+# - head: output projection
+# - img_emb: CLIP image embedding (for i2v/ti2v mode)
+remain_fp_regex: text_embedding|time_embedding|time_projection|head|img_emb
+
+# ViDiT-Q: apply rotation + channel scaling to later blocks
+# Wan2.2-5B has 30 blocks (blocks.0 ~ blocks.29)
+# Apply ViDiT-Q to blocks 22-29 (last ~27% of layers)
+viditq:
+  alpha: 0.75
+  layer_name_regex: blocks\.2[2-9]
+
+calib_data:
+  save_path: ./calib_data.pth
+
+weight:
+  n_bits: 8
+  sym: False
+act:
+  n_bits: 8
+  sym: True

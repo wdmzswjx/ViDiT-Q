@@ -1,5 +1,6 @@
-# ViDiT-Q W4A8 Mixed Precision config for Wan2.2-Fun
+# ViDiT-Q W4A8 Mixed Precision config for Wan2.2-Fun (general/14B)
 # 4-bit weight, 8-bit activation with mixed precision per layer
+# For 5B model, use w4a8_mixed_precision_5B.yaml instead
 
 model:
     model_id: "wan2.2_fun"

@@ -1,5 +1,6 @@
-# ViDiT-Q W8A8 quantization config for Wan2.2-Fun
+# ViDiT-Q W8A8 quantization config for Wan2.2-Fun (general/14B)
 # Basic 8-bit weight and 8-bit activation quantization
+# For 5B model, use w8a8_5B.yaml instead
 
 model:
     model_id: "wan2.2_fun"
