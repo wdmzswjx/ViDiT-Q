@@ -83,14 +83,30 @@ class QuantWanModel(nn.Module):
         )
 
     def load_quant_param_dict(self, quant_param_dict):
-        """Load saved quantization parameters."""
+        """Load saved quantization parameters.
+
+        Handles device mismatch: quant_param_dict from torch.load() is on CPU,
+        but model weights may be on CUDA. We move all tensors to the model's
+        device before passing to the core load function.
+        """
+        # Move all tensors in quant_param_dict to the model device
+        device = next(self.model.parameters()).device
+        quant_param_dict_on_device = {}
+        for layer_name, params in quant_param_dict.items():
+            quant_param_dict_on_device[layer_name] = {}
+            for k, v in params.items():
+                if isinstance(v, torch.Tensor):
+                    quant_param_dict_on_device[layer_name][k] = v.to(device)
+                else:
+                    quant_param_dict_on_device[layer_name][k] = v
+
         apply_func_to_submodules(
             self.model,
             class_type=BaseQuantizer,
             function=load_quant_param_dict_,
             full_name=None,
             parent_module=None,
-            quant_param_dict=quant_param_dict,
+            quant_param_dict=quant_param_dict_on_device,
             model=self,
         )
 
@@ -183,13 +199,23 @@ class QuantWanTransformer3DModel(nn.Module):
         )
 
     def load_quant_param_dict(self, quant_param_dict):
+        device = next(self.model.parameters()).device
+        quant_param_dict_on_device = {}
+        for layer_name, params in quant_param_dict.items():
+            quant_param_dict_on_device[layer_name] = {}
+            for k, v in params.items():
+                if isinstance(v, torch.Tensor):
+                    quant_param_dict_on_device[layer_name][k] = v.to(device)
+                else:
+                    quant_param_dict_on_device[layer_name][k] = v
+
         apply_func_to_submodules(
             self.model,
             class_type=BaseQuantizer,
             function=load_quant_param_dict_,
             full_name=None,
             parent_module=None,
-            quant_param_dict=quant_param_dict,
+            quant_param_dict=quant_param_dict_on_device,
             model=self,
         )
 
