@@ -275,10 +275,16 @@ class WanAttentionBlockWithCudaKernel(nn.Module):
         else:
             e = (self.modulation + e).chunk(6, dim=1)
 
-        # Helper: expand [B, 1, C] modulation to [B, L, C] for fused kernels
-        # (the fused kernel needs per-token shift/scale matching input shape)
+        # Helper: ensure modulation has shape [B, L, C] for fused kernels.
+        # mod may be [B, 1, C] (broadcast) or [B, L_orig, C] (per-token).
         def expand_mod(mod):
-            return mod.expand(B, L, C).contiguous()
+            if mod.shape[1] == 1:
+                return mod.expand(B, L, C).contiguous()
+            elif mod.shape[1] == L:
+                return mod.contiguous()
+            else:
+                # mod is [B, L_orig, C], pad to [B, L, C]
+                return F.pad(mod, (0, 0, 0, L - mod.shape[1])).contiguous()
 
         # ===== Self-Attention =====
         residual = x
