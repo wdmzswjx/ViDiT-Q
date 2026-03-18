@@ -179,13 +179,21 @@ class WanFFNWithCudaKernel(nn.Module):
         # Use fc1/fc2 naming — state dict keys remapped from ffn.0/ffn.2
         self.fc1 = W8A8OF16LinearDynamicInputScale(dim, ffn_dim, has_bias=has_bias, weight_sym=weight_sym)
         self.fc2 = W8A8OF16LinearDynamicInputScale(ffn_dim, dim, has_bias=has_bias, weight_sym=weight_sym)
+        self.ffn_dim = ffn_dim
         self.quant_params = quant_params
 
     def forward(self, x):
         """x: INT8 input from fused LayerNorm kernel, quant_params already filled."""
         x = self.fc1(x, self.quant_params)                  # INT8 → FP16
-        x = fused_kernels.gelu_quant_sum(                   # FP16 → GELU → INT8
-            x, self.quant_params.sum_input, self.quant_params.scale_input)
+        if self.ffn_dim <= 8192:
+            x = fused_kernels.gelu_quant_sum(               # FP16 → GELU → INT8
+                x, self.quant_params.sum_input, self.quant_params.scale_input)
+        else:
+            # Fallback: fused kernel only supports hidden_size <= 8192
+            x = torch.nn.functional.gelu(x)
+            x = fused_kernels.quant_sum(
+                x.contiguous(),
+                self.quant_params.sum_input, self.quant_params.scale_input)
         x = self.fc2(x, self.quant_params)                  # INT8 → FP16
         return x
 
