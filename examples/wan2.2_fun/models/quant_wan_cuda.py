@@ -158,11 +158,16 @@ class WanSelfAttentionWithCudaKernel(nn.Module):
         k = self.norm_k(_w8a8_with_padding(self.k, x, self.quant_params)).view(b, s, n, d)
         v = _w8a8_with_padding(self.v, x, self.quant_params).view(b, s, n, d)
 
-        # RoPE + attention in FP16
+        # RoPE in FP16, then attention in BF16.
+        # BF16 has the same exponent range as FP32 (~3.4e38 vs FP16's ~65504),
+        # preventing softmax overflow on large Q*K^T logits that cause the
+        # "red tint / high-noise" artifacts observed with FP16 attention.
         q, k = rope_apply_fn(q, k, grid_sizes, freqs)
-        x = attention_fn(q.to(dtype), k.to(dtype), v=v.to(dtype),
+        x = attention_fn(q.to(torch.bfloat16), k.to(torch.bfloat16),
+                         v=v.to(torch.bfloat16),
                          k_lens=seq_lens, window_size=self.window_size)
-        x = x.to(dtype).flatten(2)
+        # Convert back to FP16: subsequent quant_sum fused kernel requires FP16.
+        x = x.to(torch.float16).flatten(2)
 
         # Quantize attention output for O projection
         M = x.shape[0] * x.shape[1]
@@ -205,12 +210,14 @@ class WanCrossAttentionWithCudaKernel(nn.Module):
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
         q = self.norm_q(_w8a8_with_padding(self.q, x, self.quant_params)).view(b, -1, n, d)
-        k = self.norm_k(self.k(context.to(dtype))).view(b, -1, n, d)
-        v = self.v(context.to(dtype)).view(b, -1, n, d)
+        k = self.norm_k(self.k(context.to(torch.float16))).view(b, -1, n, d)
+        v = self.v(context.to(torch.float16)).view(b, -1, n, d)
 
-        x = attention_fn(q.to(dtype), k.to(dtype), v.to(dtype),
-                         k_lens=context_lens)
-        x = x.to(dtype).flatten(2)
+        # Attention in BF16 for numerical stability (avoids FP16 softmax overflow).
+        x = attention_fn(q.to(torch.bfloat16), k.to(torch.bfloat16),
+                         v.to(torch.bfloat16), k_lens=context_lens)
+        # Convert back to FP16: subsequent quant_sum fused kernel requires FP16.
+        x = x.to(torch.float16).flatten(2)
 
         # Quantize attention output for O projection
         M = x.shape[0] * x.shape[1]
@@ -338,9 +345,10 @@ class WanAttentionBlockWithCudaKernel(nn.Module):
         # Fused: LayerNorm(x) * (1 + scale) + shift → INT8, fills quant_params
         x = self.norm1(x.contiguous(), expand_mod(e[0]), expand_mod(e[1]),
                        self.quant_params)
-        # Self-attention with INT8 kernels (W8A8 padding handled inside)
+        # Self-attention with INT8 kernels (W8A8 padding handled inside).
+        # Note: attention internally uses BF16 to avoid FP16 softmax overflow.
         x = self.self_attn(x, seq_lens, grid_sizes, freqs,
-                           self.attention_fn, self.rope_apply_fn, torch.float16, t)
+                           self.attention_fn, self.rope_apply_fn, torch.bfloat16, t)
         # Gated residual: residual + attn_out * gate
         x = fused_kernels.gate_residual_fuse(
             x.contiguous().view(-1, C),
@@ -356,7 +364,7 @@ class WanAttentionBlockWithCudaKernel(nn.Module):
         x_quant = fused_kernels.quant_sum(
             x_norm.contiguous(), sum_s, scale_s)
         x = self.cross_attn(x_quant, context, context_lens,
-                            self.attention_fn, torch.float16, t)
+                            self.attention_fn, torch.bfloat16, t)
         x = residual + x
 
         # ===== FFN =====
