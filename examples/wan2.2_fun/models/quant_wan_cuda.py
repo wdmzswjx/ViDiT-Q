@@ -251,6 +251,14 @@ class WanAttentionBlockWithCudaKernel(nn.Module):
 
         B, L, C = x.shape
 
+        # Ensure QuantParams buffers are large enough for B * L tokens
+        total_tokens = B * L
+        if self.quant_params.scale_input.numel() < total_tokens:
+            logger.warning("QuantParams buffer too small (%d < %d), reallocating",
+                           self.quant_params.scale_input.numel(), total_tokens)
+            self.quant_params = QuantParams(
+                total_tokens, has_sum_input=True, device=x.device)
+
         # Compute modulation: 6 vectors of shape [B, 1, C]
         if e.dim() > 3:
             e = (self.modulation.unsqueeze(0) + e).chunk(6, dim=2)
