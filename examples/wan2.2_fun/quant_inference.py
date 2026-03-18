@@ -105,12 +105,35 @@ def main(args):
     if if_mixed_precision:
         model.bitwidth_refactor()
 
-    # Load quantization parameters
-    logger.info("Loading quant params from %s ...", args.quant_params)
-    quant_param_dict = torch.load(args.quant_params, weights_only=True)
-    model.load_quant_param_dict(quant_param_dict)
-    model.set_init_done()
-    logger.info("Quantized model ready for inference")
+    # Load quantization parameters and apply
+    if args.hardware:
+        # ---- Real INT8 inference with CUDA kernels ----
+        logger.info("Using CUDA kernel INT8 inference (hardware mode)")
+        int_weight_path = os.path.join(args.save_dir, 'int_weight.pt')
+
+        if not os.path.exists(int_weight_path) or args.regenerate_int_weight:
+            # Generate int_weight.pt from quant_params
+            logger.info("Loading quant params from %s ...", args.quant_params)
+            quant_param_dict = torch.load(args.quant_params, weights_only=True)
+            model.load_quant_param_dict(quant_param_dict)
+            model.set_init_done()
+            logger.info("Generating INT8 checkpoint: %s", int_weight_path)
+            model.quantize_and_save_weight(save_path=int_weight_path)
+        else:
+            logger.info("Using existing INT8 checkpoint: %s", int_weight_path)
+
+        model.hardware_forward_refactor(
+            load_path=int_weight_path,
+            max_seq_len=args.max_seq_len,
+        )
+        logger.info("CUDA kernel model ready for inference")
+    else:
+        # ---- Fake-quantized simulation inference ----
+        logger.info("Loading quant params from %s ...", args.quant_params)
+        quant_param_dict = torch.load(args.quant_params, weights_only=True)
+        model.load_quant_param_dict(quant_param_dict)
+        model.set_init_done()
+        logger.info("Quantized model ready for inference (simulation mode)")
 
     # Print model summary
     n_quant = sum(1 for m in model.model.modules() if isinstance(m, QuantizedLinear) and m.quant_mode)
@@ -184,5 +207,12 @@ if __name__ == "__main__":
     parser.add_argument("--guidance-scale", type=float, default=5.0)
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16"])
     parser.add_argument("--seed", type=int, default=42)
+    # CUDA kernel INT8 inference options
+    parser.add_argument("--hardware", action="store_true",
+                        help="Use CUDA kernel INT8 inference (requires viditq_extension)")
+    parser.add_argument("--max-seq-len", type=int, default=300000,
+                        help="Max token buffer size for QuantParams (>= 2*num_image_tokens)")
+    parser.add_argument("--regenerate-int-weight", action="store_true",
+                        help="Force regenerate int_weight.pt even if it exists")
     args = parser.parse_args()
     main(args)
