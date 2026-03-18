@@ -49,6 +49,22 @@ void layernorm_nobias_t2i_quant_sum_fuse(torch::Tensor &output,    // [batch_siz
               torch::Tensor &scaling, // [batch_size * tokens]
               float epsilon);
 
+void rmsnorm_nobias_t2i_fuse(torch::Tensor &output,    // [batch_size * tokens, hidden_size]
+              torch::Tensor &input,  // [batch_size * tokens, hidden_size]
+              torch::Tensor &weight, // [hidden_size]
+              torch::Tensor &shift_msa, // [batch_size, hidden_size]
+              torch::Tensor &scale_msa, // [batch_size, hidden_size]
+              float epsilon);
+
+void rmsnorm_nobias_t2i_quant_sum_fuse(torch::Tensor &output,    // [batch_size * tokens, hidden_size]
+              torch::Tensor &input,  // [batch_size * tokens, hidden_size]
+              torch::Tensor &weight, // [hidden_size]
+              torch::Tensor &shift_msa, // [batch_size, hidden_size]
+              torch::Tensor &scale_msa, // [batch_size, hidden_size]
+              torch::Tensor &sum_output, // [batch_size * tokens]
+              torch::Tensor &scaling, // [batch_size * tokens]
+              float epsilon);
+
 torch::Tensor gate_residual_fuse(torch::Tensor &input,  // [batch_size * tokens, hidden_size]
               torch::Tensor &gate_msa, // [batch_size, hidden_size]
               torch::Tensor &residual // [batch_size * tokens, hidden_size]
@@ -93,6 +109,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                           torch::Tensor &, float>(
             &layernorm_nobias_t2i_quant_sum_fuse),
         "layernorm with t2i modulate and quantization kernel, output sum");
+
+  m.def("rmsnorm_nobias_t2i_fuse",
+        py::overload_cast<torch::Tensor &, torch::Tensor &, torch::Tensor &,
+                          torch::Tensor &, torch::Tensor &, float>(
+            &rmsnorm_nobias_t2i_fuse),
+        "rmsnorm with t2i modulate kernel (for Wan model)");
+
+  m.def("rmsnorm_nobias_t2i_quant_sum_fuse",
+        py::overload_cast<torch::Tensor &, torch::Tensor &, torch::Tensor &,
+                          torch::Tensor &, torch::Tensor &, torch::Tensor &,
+                          torch::Tensor &, float>(
+            &rmsnorm_nobias_t2i_quant_sum_fuse),
+        "rmsnorm with t2i modulate and quantization kernel, output sum (for Wan model)");
 
   m.def("gate_residual_fuse", &gate_residual_fuse,
         "gate msa with residual kernel");

@@ -273,9 +273,10 @@ class WanAttentionBlockWithCudaKernel(nn.Module):
         self.attention_fn = None
         self.rope_apply_fn = None
 
-        # Fused LayerNorm + T2I modulation + quantization
-        self.norm1 = LayerNormGeneral(dim, act_sum=True, eps=eps)
-        self.norm2 = LayerNormGeneral(dim, act_sum=True, eps=eps)
+        # Fused RMSNorm + T2I modulation + quantization
+        # (Wan model uses RMSNorm, not standard LayerNorm)
+        self.norm1 = LayerNormGeneral(dim, act_sum=True, eps=eps, use_rmsnorm=True)
+        self.norm2 = LayerNormGeneral(dim, act_sum=True, eps=eps, use_rmsnorm=True)
 
         # Cross-attention norm (applied before quantization, NOT fused)
         self.cross_attn_norm = cross_attn_norm

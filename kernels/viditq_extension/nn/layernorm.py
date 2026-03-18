@@ -9,6 +9,7 @@ class LayerNormGeneral(nn.Module):
         hidden_size : int,
         act_sum : bool = False,
         eps: float = 1e-6,
+        use_rmsnorm: bool = False,
     ):
         super().__init__()
 
@@ -18,6 +19,7 @@ class LayerNormGeneral(nn.Module):
         self.variance_eps = eps
 
         self.act_sum = act_sum
+        self.use_rmsnorm = use_rmsnorm
 
     @classmethod
     def from_layer_norm(cls, layer_norm: nn.LayerNorm):
@@ -27,7 +29,7 @@ class LayerNormGeneral(nn.Module):
         )
         ln.weight = layer_norm.weight.clone().to(torch.float16)
         return ln
-    
+
     def forward(
         self,
         input: torch.Tensor,
@@ -40,16 +42,28 @@ class LayerNormGeneral(nn.Module):
         hidden_dim = shape[-1]
         input = input.view(-1, hidden_dim)
         output = torch.empty_like(input, dtype=torch.int8)
-        # TODO: implement the complete forward pass
-        fused_kernels.layernorm_nobias_t2i_quant_sum_fuse(
-            output,
-            input,
-            self.weight,
-            shift_msa.view(-1, hidden_dim),
-            scale_msa.view(-1, hidden_dim),
-            quant_params.sum_input,
-            quant_params.scale_input,
-            self.variance_eps,
-        )
+
+        if self.use_rmsnorm:
+            fused_kernels.rmsnorm_nobias_t2i_quant_sum_fuse(
+                output,
+                input,
+                self.weight,
+                shift_msa.view(-1, hidden_dim),
+                scale_msa.view(-1, hidden_dim),
+                quant_params.sum_input,
+                quant_params.scale_input,
+                self.variance_eps,
+            )
+        else:
+            fused_kernels.layernorm_nobias_t2i_quant_sum_fuse(
+                output,
+                input,
+                self.weight,
+                shift_msa.view(-1, hidden_dim),
+                scale_msa.view(-1, hidden_dim),
+                quant_params.sum_input,
+                quant_params.scale_input,
+                self.variance_eps,
+            )
 
         return output.view(shape)

@@ -398,7 +398,7 @@ __global__ void QuantKernelLooped(const half *__restrict__ input,
   }
 }
 
-template <bool has_t2i=false, bool quant=false, SumType sum_type=SumType::kNone>
+template <bool has_t2i=false, bool quant=false, SumType sum_type=SumType::kNone, bool use_rmsnorm=false>
 __global__ void LayernormT2iQuantFuse(const half *__restrict__ input, const half *__restrict__ gamma,  int8_t *__restrict__ normed_output_quant, half *__restrict__ normed_output, half *__restrict__ sum_output, const half *__restrict__ shift_msa, const half *__restrict__ scale_msa, const float eps,
     const int shift_stride, const int scale_stride, const int batch_num_rows, const int hidden_dim, half* __restrict__ scale)
 {
@@ -422,27 +422,37 @@ __global__ void LayernormT2iQuantFuse(const half *__restrict__ input, const half
   *(float2*)(&x_val[0]) = *(float2*)(&input[bidx * hidden_dim + j]);
   *(float2*)(&w_val[0]) = *(float2*)(&gamma[j]);
 
-  local_sum += __half2float(x_val[0].x);
-  local_sum += __half2float(x_val[0].y);
-  local_sum += __half2float(x_val[1].x);
-  local_sum += __half2float(x_val[1].y);
+  if constexpr (!use_rmsnorm) {
+    // Standard LayerNorm: compute mean for mean subtraction
+    local_sum += __half2float(x_val[0].x);
+    local_sum += __half2float(x_val[0].y);
+    local_sum += __half2float(x_val[1].x);
+    local_sum += __half2float(x_val[1].y);
 
-  mean = vllm::blockReduceSum(local_sum);
+    mean = vllm::blockReduceSum(local_sum);
 
-  // TODO: whether to use reduce or all reduce?
-  if (threadIdx.x == 0)
-  {
-    mean = mean / hidden_dim;
-    s_mean = mean;
+    if (threadIdx.x == 0)
+    {
+      mean = mean / hidden_dim;
+      s_mean = mean;
+    }
+    __syncthreads();
+
+    mean = s_mean;
+
+    // Variance: sum((x - mean)^2)
+    local_var_sum += (__half2float(x_val[0].x) - mean) * (__half2float(x_val[0].x) - mean);
+    local_var_sum += (__half2float(x_val[0].y) - mean) * (__half2float(x_val[0].y) - mean);
+    local_var_sum += (__half2float(x_val[1].x) - mean) * (__half2float(x_val[1].x) - mean);
+    local_var_sum += (__half2float(x_val[1].y) - mean) * (__half2float(x_val[1].y) - mean);
+  } else {
+    // RMSNorm: compute sum(x^2), no mean subtraction
+    mean = 0.0f;  // not used
+    local_var_sum += __half2float(x_val[0].x) * __half2float(x_val[0].x);
+    local_var_sum += __half2float(x_val[0].y) * __half2float(x_val[0].y);
+    local_var_sum += __half2float(x_val[1].x) * __half2float(x_val[1].x);
+    local_var_sum += __half2float(x_val[1].y) * __half2float(x_val[1].y);
   }
-  __syncthreads();
-
-  mean = s_mean;
-
-  local_var_sum += (__half2float(x_val[0].x) - mean) * (__half2float(x_val[0].x) - mean);
-  local_var_sum += (__half2float(x_val[0].y) - mean) * (__half2float(x_val[0].y) - mean);
-  local_var_sum += (__half2float(x_val[1].x) - mean) * (__half2float(x_val[1].x) - mean);
-  local_var_sum += (__half2float(x_val[1].y) - mean) * (__half2float(x_val[1].y) - mean);
 
   variance = vllm::blockReduceSum(local_var_sum);
 
@@ -452,7 +462,7 @@ __global__ void LayernormT2iQuantFuse(const half *__restrict__ input, const half
   }
   __syncthreads();
 
-  // abuse this variable. this is actually the reciprocal of the standard deviation
+  // this is actually the reciprocal of the standard deviation (or RMS)
   variance = s_variance;
 
   x_val[0].x = __float2half_rn((__half2float(x_val[0].x) - mean) * variance * __half2float(w_val[0].x));
@@ -1151,6 +1161,124 @@ void layernorm_nobias_t2i_quant_sum_fuse(torch::Tensor &output,    // [batch_siz
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   LayernormT2iQuantFuse<true, true, SumType::kPostQuant><<<grid, block, 0, stream>>>(
+    reinterpret_cast<half*>(input.data_ptr<at::Half>()),
+    reinterpret_cast<half*>(weight.data_ptr<at::Half>()),
+    output.data_ptr<int8_t>(),
+    nullptr,
+    reinterpret_cast<half*>(sum_output.data_ptr<at::Half>()),
+    reinterpret_cast<half*>(shift_msa.data_ptr<at::Half>()), reinterpret_cast<half*>(scale_msa.data_ptr<at::Half>()),
+    epsilon, shift_stride, scale_stride,
+    num_tokens, hidden_size, reinterpret_cast<half*>(scaling.data_ptr<at::Half>()));
+}
+
+// ---- RMSNorm variants (for Wan model which uses RMSNorm instead of LayerNorm) ----
+
+void rmsnorm_nobias_t2i_fuse(torch::Tensor &output,    // [batch_size * tokens, hidden_size]
+              torch::Tensor &input,  // [batch_size * tokens, hidden_size]
+              torch::Tensor &weight, // [hidden_size]
+              torch::Tensor &shift_msa, // [batch_size, hidden_size]
+              torch::Tensor &scale_msa, // [batch_size, hidden_size]
+              float epsilon) {
+  CHECK_CUDA(output);
+  CHECK_CUDA(input);
+  CHECK_CUDA(weight);
+  CHECK_CUDA(shift_msa);
+  CHECK_CUDA(scale_msa);
+
+  CHECK_CONTIGUOUS(output);
+  CHECK_CONTIGUOUS(input);
+  CHECK_CONTIGUOUS(weight);
+  CHECK_LASTDIM_CONTIGUOUS(shift_msa);
+  CHECK_LASTDIM_CONTIGUOUS(scale_msa);
+
+  CHECK_DTYPE(output, torch::kFloat16);
+  CHECK_DTYPE(input, torch::kFloat16);
+  CHECK_DTYPE(weight, torch::kFloat16);
+  CHECK_DTYPE(shift_msa, torch::kFloat16);
+  CHECK_DTYPE(scale_msa, torch::kFloat16);
+
+  int batch_size = shift_msa.size(0);
+  int hidden_size = shift_msa.size(1);
+  int num_tokens = input.size(0) / batch_size;
+  int shift_stride = shift_msa.stride(0);
+  int scale_stride = scale_msa.stride(0);
+
+  CHECK_SHAPE(input, batch_size * num_tokens, hidden_size);
+  CHECK_SHAPE(output, batch_size * num_tokens, hidden_size);
+  CHECK_SHAPE(weight, hidden_size);
+  CHECK_SHAPE(shift_msa, batch_size, hidden_size);
+  CHECK_SHAPE(scale_msa, batch_size, hidden_size);
+
+  assert(hidden_size % 128 == 0);
+  dim3 grid(num_tokens * batch_size);
+  dim3 block(hidden_size / 4);
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  LayernormT2iQuantFuse<true, false, SumType::kNone, true><<<grid, block, 0, stream>>>(
+    reinterpret_cast<half*>(input.data_ptr<at::Half>()),
+    reinterpret_cast<half*>(weight.data_ptr<at::Half>()),
+    nullptr,
+    reinterpret_cast<half*>(output.data_ptr<at::Half>()),
+    nullptr,
+    reinterpret_cast<half*>(shift_msa.data_ptr<at::Half>()), reinterpret_cast<half*>(scale_msa.data_ptr<at::Half>()),
+    epsilon, shift_stride, scale_stride,
+    num_tokens, hidden_size, nullptr);
+}
+
+void rmsnorm_nobias_t2i_quant_sum_fuse(torch::Tensor &output,    // [batch_size * tokens, hidden_size]
+              torch::Tensor &input,  // [batch_size * tokens, hidden_size]
+              torch::Tensor &weight, // [hidden_size]
+              torch::Tensor &shift_msa, // [batch_size, hidden_size]
+              torch::Tensor &scale_msa, // [batch_size, hidden_size]
+              torch::Tensor &sum_output, // [batch_size * tokens]
+              torch::Tensor &scaling, // [batch_size * tokens]
+              float epsilon) {
+  CHECK_CUDA(output);
+  CHECK_CUDA(input);
+  CHECK_CUDA(weight);
+  CHECK_CUDA(shift_msa);
+  CHECK_CUDA(scale_msa);
+  CHECK_CUDA(sum_output);
+  CHECK_CUDA(scaling);
+
+  CHECK_CONTIGUOUS(output);
+  CHECK_CONTIGUOUS(input);
+  CHECK_CONTIGUOUS(weight);
+  CHECK_LASTDIM_CONTIGUOUS(shift_msa);
+  CHECK_LASTDIM_CONTIGUOUS(scale_msa);
+  CHECK_CONTIGUOUS(sum_output);
+  CHECK_CONTIGUOUS(scaling);
+
+  CHECK_DTYPE(output, torch::kInt8);
+  CHECK_DTYPE(input, torch::kFloat16);
+  CHECK_DTYPE(weight, torch::kFloat16);
+  CHECK_DTYPE(shift_msa, torch::kFloat16);
+  CHECK_DTYPE(scale_msa, torch::kFloat16);
+  CHECK_DTYPE(sum_output, torch::kFloat16);
+  CHECK_DTYPE(scaling, torch::kFloat16);
+
+  int batch_size = shift_msa.size(0);
+  int hidden_size = shift_msa.size(1);
+  int num_tokens = input.size(0) / batch_size;
+  int shift_stride = shift_msa.stride(0);
+  int scale_stride = scale_msa.stride(0);
+
+  CHECK_SHAPE(input, batch_size * num_tokens, hidden_size);
+  CHECK_SHAPE(output, batch_size * num_tokens, hidden_size);
+  CHECK_SHAPE(weight, hidden_size);
+  CHECK_SHAPE(shift_msa, batch_size, hidden_size);
+  CHECK_SHAPE(scale_msa, batch_size, hidden_size);
+  CHECK_SHAPE(sum_output, batch_size * num_tokens);
+  CHECK_SHAPE(scaling, batch_size * num_tokens);
+
+  assert(hidden_size % 128 == 0);
+  dim3 grid(num_tokens * batch_size);
+  dim3 block(hidden_size / 4);
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  LayernormT2iQuantFuse<true, true, SumType::kPostQuant, true><<<grid, block, 0, stream>>>(
     reinterpret_cast<half*>(input.data_ptr<at::Half>()),
     reinterpret_cast<half*>(weight.data_ptr<at::Half>()),
     output.data_ptr<int8_t>(),
