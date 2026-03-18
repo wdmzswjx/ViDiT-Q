@@ -242,6 +242,13 @@ class WanAttentionBlockWithCudaKernel(nn.Module):
 
     def forward(self, x, e, seq_lens, grid_sizes, freqs,
                 context, context_lens, dtype=torch.bfloat16, t=0):
+        # Fused CUDA kernels require float16; cast from bfloat16 if needed
+        input_dtype = x.dtype
+        if x.dtype != torch.float16:
+            x = x.to(torch.float16)
+            e = e.to(torch.float16)
+            context = context.to(torch.float16)
+
         B, L, C = x.shape
 
         # Compute modulation: 6 vectors of shape [B, 1, C]
@@ -263,7 +270,7 @@ class WanAttentionBlockWithCudaKernel(nn.Module):
                        self.quant_params)
         # Self-attention with INT8 kernels
         x = self.self_attn(x, seq_lens, grid_sizes, freqs,
-                           self.attention_fn, self.rope_apply_fn, dtype, t)
+                           self.attention_fn, self.rope_apply_fn, torch.float16, t)
         # Gated residual: residual + attn_out * gate
         x = fused_kernels.gate_residual_fuse(
             x.contiguous().view(-1, C),
@@ -279,7 +286,7 @@ class WanAttentionBlockWithCudaKernel(nn.Module):
             x_norm.contiguous(),
             self.quant_params.sum_input, self.quant_params.scale_input)
         x = self.cross_attn(x_quant, context, context_lens,
-                            self.attention_fn, dtype, t)
+                            self.attention_fn, torch.float16, t)
         x = residual + x
 
         # ===== FFN =====
@@ -294,5 +301,9 @@ class WanAttentionBlockWithCudaKernel(nn.Module):
             expand_mod(e[5]).view(-1, C),
             residual.contiguous().view(-1, C),
         ).reshape(B, L, C)
+
+        # Cast back to original dtype if needed
+        if input_dtype != torch.float16:
+            x = x.to(input_dtype)
 
         return x
