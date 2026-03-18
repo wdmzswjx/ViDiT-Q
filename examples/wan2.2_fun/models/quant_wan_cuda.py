@@ -15,8 +15,10 @@ Architecture mapping (Wan → CUDA kernel):
     - WanLayerNorm + modulation → LayerNormGeneral (fused LN + modulate + quantize)
 """
 
+import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import logging
 
 from viditq_extension.nn.base import QuantParams
@@ -27,6 +29,9 @@ import viditq_extension.fused as fused_kernels
 from qdiff.base.quant_layer import QuantizedLinear
 
 logger = logging.getLogger(__name__)
+
+# W8A8 GEMM tile size — M (total tokens) must be a multiple of this
+W8A8_CTA_M = 128
 
 
 # ---------------------------------------------------------------------------
@@ -249,13 +254,17 @@ class WanAttentionBlockWithCudaKernel(nn.Module):
             e = e.to(torch.float16)
             context = context.to(torch.float16)
 
-        B, L, C = x.shape
+        B, L_orig, C = x.shape
 
-        # Ensure QuantParams buffers are large enough for B * L tokens
+        # Pad L so that B*L is a multiple of W8A8_CTA_M (128) for GEMM alignment
+        step = W8A8_CTA_M // math.gcd(B, W8A8_CTA_M)
+        L = ((L_orig + step - 1) // step) * step
+        if L != L_orig:
+            x = F.pad(x, (0, 0, 0, L - L_orig))  # zero-pad along L dim
+
+        # Ensure QuantParams buffers match exactly B * L tokens
         total_tokens = B * L
-        if self.quant_params.scale_input.numel() < total_tokens:
-            logger.warning("QuantParams buffer too small (%d < %d), reallocating",
-                           self.quant_params.scale_input.numel(), total_tokens)
+        if self.quant_params.scale_input.numel() != total_tokens:
             self.quant_params = QuantParams(
                 total_tokens, has_sum_input=True, device=x.device)
 
@@ -309,6 +318,10 @@ class WanAttentionBlockWithCudaKernel(nn.Module):
             expand_mod(e[5]).view(-1, C),
             residual.contiguous().view(-1, C),
         ).reshape(B, L, C)
+
+        # Remove padding tokens
+        if L != L_orig:
+            x = x[:, :L_orig, :]
 
         # Cast back to original dtype if needed
         if input_dtype != torch.float16:
