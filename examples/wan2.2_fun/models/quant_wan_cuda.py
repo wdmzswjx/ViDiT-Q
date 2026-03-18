@@ -306,7 +306,7 @@ class WanAttentionBlockWithCudaKernel(nn.Module):
 
         # ===== Cross-Attention =====
         residual = x
-        x_norm = self.norm3(x)
+        x_norm = self.norm3(x).to(torch.float16)
         # Quantize image features for cross-attention Q
         x_quant = fused_kernels.quant_sum(
             x_norm.contiguous(),
