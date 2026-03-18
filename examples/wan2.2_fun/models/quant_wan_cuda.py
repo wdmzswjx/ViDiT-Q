@@ -185,15 +185,8 @@ class WanFFNWithCudaKernel(nn.Module):
     def forward(self, x):
         """x: INT8 input from fused LayerNorm kernel, quant_params already filled."""
         x = self.fc1(x, self.quant_params)                  # INT8 → FP16
-        if self.ffn_dim <= 8192:
-            x = fused_kernels.gelu_quant_sum(               # FP16 → GELU → INT8
-                x, self.quant_params.sum_input, self.quant_params.scale_input)
-        else:
-            # Fallback: fused kernel only supports hidden_size <= 8192
-            x = torch.nn.functional.gelu(x)
-            x = fused_kernels.quant_sum(
-                x.contiguous(),
-                self.quant_params.sum_input, self.quant_params.scale_input)
+        x = fused_kernels.gelu_quant_sum(                   # FP16 → GELU → INT8
+            x, self.quant_params.sum_input, self.quant_params.scale_input)
         x = self.fc2(x, self.quant_params)                  # INT8 → FP16
         return x
 

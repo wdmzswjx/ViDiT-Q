@@ -231,6 +231,173 @@ __global__ void GeluQuantFuse(const half *__restrict__ input,
   *reinterpret_cast<OutputType*>(&output[bidx * hidden_size + j]) = *reinterpret_cast<OutputType*>(&o_val);
 }
 
+// Looped version: each thread processes multiple chunks to support hidden_size > 8192.
+// Uses ELEMS_PER_THREAD elements per thread, with blockDim.x threads.
+template<int ELEMS_PER_THREAD, SumType sum_type=SumType::kNone>
+__global__ void GeluQuantFuseLooped(const half *__restrict__ input,
+                             int8_t *__restrict__ output, half *__restrict__ sum_output, half *__restrict__ scale,
+                             int num_tokens, int hidden_size) {
+  const int tidx = threadIdx.x;
+  const int bidx = blockIdx.x;
+  const half *row_in = input + bidx * hidden_size;
+  int8_t *row_out = output + bidx * hidden_size;
+
+  // Phase 1: GELU + find per-thread amax
+  float amax_val = 0.0f;
+  float local_sum_pre = 0.0f;
+  int32_t local_sum_post = 0;
+
+  // We process 4 halfs (= 2 half2 = 1 float2) per iteration, ELEMS_PER_THREAD / 4 iters
+  // Total elements covered: blockDim.x * ELEMS_PER_THREAD
+  constexpr int ITERS = ELEMS_PER_THREAD / 4;
+  half2 x_cache[ITERS][2]; // cache GELU results for phase 2
+
+  for (int iter = 0; iter < ITERS; iter++) {
+    int idx = (tidx * ITERS + iter) * 4;
+    if (idx < hidden_size) {
+      half2 x_val[2];
+      *(float2*)(&x_val[0]) = *(float2*)(&row_in[idx]);
+      x_val[0].x = gelu_func(x_val[0].x);
+      x_val[0].y = gelu_func(x_val[0].y);
+      x_val[1].x = gelu_func(x_val[1].x);
+      x_val[1].y = gelu_func(x_val[1].y);
+      x_cache[iter][0] = x_val[0];
+      x_cache[iter][1] = x_val[1];
+
+      if constexpr (sum_type == SumType::kPreQuant) {
+        local_sum_pre += __half2float(x_val[0].x) + __half2float(x_val[0].y)
+                       + __half2float(x_val[1].x) + __half2float(x_val[1].y);
+      }
+      amax_val = fmaxf(amax_val, fmaxf(
+        fmaxf(__half2float(__habs(x_val[0].x)), __half2float(__habs(x_val[0].y))),
+        fmaxf(__half2float(__habs(x_val[1].x)), __half2float(__habs(x_val[1].y)))));
+    }
+  }
+
+  if constexpr (sum_type == SumType::kPreQuant) {
+    float sum = vllm::blockReduceSum(local_sum_pre);
+    if (tidx == 0) sum_output[bidx] = __float2half_rn(sum);
+  }
+
+  __shared__ float s_amax;
+  float block_amax = vllm::blockReduceMax(amax_val);
+  if (tidx == 0) {
+    s_amax = block_amax;
+    scale[bidx] = __float2half_rn(block_amax / 127.0f);
+  }
+  __syncthreads();
+
+  float tmp_scale = 127.0f / s_amax;
+
+  // Phase 2: quantize + write + post-quant sum
+  for (int iter = 0; iter < ITERS; iter++) {
+    int idx = (tidx * ITERS + iter) * 4;
+    if (idx < hidden_size) {
+      half2 *x_val = x_cache[iter];
+      char4 o = make_char4(
+        float_to_int8_rn((float)x_val[0].x * tmp_scale),
+        float_to_int8_rn((float)x_val[0].y * tmp_scale),
+        float_to_int8_rn((float)x_val[1].x * tmp_scale),
+        float_to_int8_rn((float)x_val[1].y * tmp_scale));
+      *reinterpret_cast<uint32_t*>(&row_out[idx]) = *reinterpret_cast<uint32_t*>(&o);
+
+      if constexpr (sum_type == SumType::kPostQuant) {
+        local_sum_post += (int32_t)o.x + (int32_t)o.y + (int32_t)o.z + (int32_t)o.w;
+      }
+    }
+  }
+
+  if constexpr (sum_type == SumType::kPostQuant) {
+    int32_t sum = vllm::blockReduceSum(local_sum_post);
+    if (tidx == 0) {
+      sum_output[bidx] = __float2half_rn(__int2float_rn(sum) / tmp_scale);
+    }
+  }
+}
+
+// Looped version of QuantKernel for hidden_size > 8192.
+template<int ELEMS_PER_THREAD, SumType sum_type=SumType::kNone, bool dynamic=true>
+__global__ void QuantKernelLooped(const half *__restrict__ input,
+                             int8_t *__restrict__ output, half *__restrict__ sum_output, half *__restrict__ scale,
+                             int num_tokens, int hidden_size) {
+  const int tidx = threadIdx.x;
+  const int bidx = blockIdx.x;
+  const half *row_in = input + bidx * hidden_size;
+  int8_t *row_out = output + bidx * hidden_size;
+
+  float amax_val = 0.0f;
+  float local_sum_pre = 0.0f;
+  int32_t local_sum_post = 0;
+
+  constexpr int ITERS = ELEMS_PER_THREAD / 4;
+  half2 x_cache[ITERS][2];
+
+  for (int iter = 0; iter < ITERS; iter++) {
+    int idx = (tidx * ITERS + iter) * 4;
+    if (idx < hidden_size) {
+      half2 x_val[2];
+      *(float2*)(&x_val[0]) = *(float2*)(&row_in[idx]);
+      x_cache[iter][0] = x_val[0];
+      x_cache[iter][1] = x_val[1];
+
+      if constexpr (sum_type == SumType::kPreQuant) {
+        local_sum_pre += __half2float(x_val[0].x) + __half2float(x_val[0].y)
+                       + __half2float(x_val[1].x) + __half2float(x_val[1].y);
+      }
+      if constexpr (dynamic) {
+        amax_val = fmaxf(amax_val, fmaxf(
+          fmaxf(__half2float(__habs(x_val[0].x)), __half2float(__habs(x_val[0].y))),
+          fmaxf(__half2float(__habs(x_val[1].x)), __half2float(__habs(x_val[1].y)))));
+      }
+    }
+  }
+
+  if constexpr (sum_type == SumType::kPreQuant) {
+    float sum = vllm::blockReduceSum(local_sum_pre);
+    if (tidx == 0) sum_output[bidx] = __float2half_rn(sum);
+  }
+
+  __shared__ float s_amax;
+  if constexpr (dynamic) {
+    float block_amax = vllm::blockReduceMax(amax_val);
+    if (tidx == 0) {
+      s_amax = block_amax;
+      scale[bidx] = __float2half_rn(block_amax / 127.0f);
+    }
+  } else {
+    if (tidx == 0) {
+      s_amax = scale[bidx];
+    }
+  }
+  __syncthreads();
+
+  float tmp_scale = 127.0f / s_amax;
+
+  for (int iter = 0; iter < ITERS; iter++) {
+    int idx = (tidx * ITERS + iter) * 4;
+    if (idx < hidden_size) {
+      half2 *x_val = x_cache[iter];
+      char4 o = make_char4(
+        float_to_int8_rn((float)x_val[0].x * tmp_scale),
+        float_to_int8_rn((float)x_val[0].y * tmp_scale),
+        float_to_int8_rn((float)x_val[1].x * tmp_scale),
+        float_to_int8_rn((float)x_val[1].y * tmp_scale));
+      *reinterpret_cast<uint32_t*>(&row_out[idx]) = *reinterpret_cast<uint32_t*>(&o);
+
+      if constexpr (sum_type == SumType::kPostQuant) {
+        local_sum_post += (int32_t)o.x + (int32_t)o.y + (int32_t)o.z + (int32_t)o.w;
+      }
+    }
+  }
+
+  if constexpr (sum_type == SumType::kPostQuant) {
+    int32_t sum = vllm::blockReduceSum(local_sum_post);
+    if (tidx == 0) {
+      sum_output[bidx] = __float2half_rn(__int2float_rn(sum) / tmp_scale);
+    }
+  }
+}
+
 template <bool has_t2i=false, bool quant=false, SumType sum_type=SumType::kNone>
 __global__ void LayernormT2iQuantFuse(const half *__restrict__ input, const half *__restrict__ gamma,  int8_t *__restrict__ normed_output_quant, half *__restrict__ normed_output, half *__restrict__ sum_output, const half *__restrict__ shift_msa, const half *__restrict__ scale_msa, const float eps,
     const int shift_stride, const int scale_stride, const int batch_num_rows, const int hidden_dim, half* __restrict__ scale)
@@ -540,13 +707,7 @@ torch::Tensor quant_sum(torch::Tensor &input,  // [..., hidden_size]
   int hidden_size = input.size(-1);
   int num_tokens = input.numel() / hidden_size;
 
-  assert(hidden_size <= 8192);
-
-  if (hidden_size > 4096) {
-    assert(hidden_size % 256 == 0);
-  } else {
-    assert(hidden_size % 128 == 0);
-  }
+  assert(hidden_size % 128 == 0);
 
   CHECK_SHAPE(sum_output, num_tokens);
   CHECK_SHAPE(scaling, num_tokens);
@@ -558,8 +719,20 @@ torch::Tensor quant_sum(torch::Tensor &input,  // [..., hidden_size]
   if (hidden_size <= 4096) {
     dim3 grid(num_tokens);
     dim3 block(hidden_size / 4);
-    
+
     QuantKernel<float2, SumType::kPostQuant><<<grid, block, 0, stream>>>(
+      reinterpret_cast<half*>(input.data_ptr<at::Half>()),
+      output.data_ptr<int8_t>(),
+      reinterpret_cast<half*>(sum_output.data_ptr<at::Half>()),
+      reinterpret_cast<half*>(scaling.data_ptr<at::Half>()),
+      num_tokens, hidden_size);
+  }
+  else if (hidden_size <= 8192)
+  {
+    dim3 grid(num_tokens);
+    dim3 block(hidden_size / 8);
+
+    QuantKernel<float4, SumType::kPostQuant><<<grid, block, 0, stream>>>(
       reinterpret_cast<half*>(input.data_ptr<at::Half>()),
       output.data_ptr<int8_t>(),
       reinterpret_cast<half*>(sum_output.data_ptr<at::Half>()),
@@ -568,15 +741,38 @@ torch::Tensor quant_sum(torch::Tensor &input,  // [..., hidden_size]
   }
   else
   {
+    // hidden_size > 8192: use looped kernel with 1024 threads
+    // Each thread handles (hidden_size / 1024) elements, rounded up to multiple of 4
+    constexpr int BLOCK_SIZE = 1024;
     dim3 grid(num_tokens);
-    dim3 block(hidden_size / 8);
-    
-    QuantKernel<float4, SumType::kPostQuant><<<grid, block, 0, stream>>>(
-      reinterpret_cast<half*>(input.data_ptr<at::Half>()),
-      output.data_ptr<int8_t>(),
-      reinterpret_cast<half*>(sum_output.data_ptr<at::Half>()),
-      reinterpret_cast<half*>(scaling.data_ptr<at::Half>()),
-      num_tokens, hidden_size);
+    dim3 block(BLOCK_SIZE);
+    int elems_per_thread = (hidden_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    // Round up to multiple of 4
+    elems_per_thread = ((elems_per_thread + 3) / 4) * 4;
+
+    // Dispatch based on elems_per_thread
+    if (elems_per_thread <= 16) {
+      QuantKernelLooped<16, SumType::kPostQuant><<<grid, block, 0, stream>>>(
+        reinterpret_cast<half*>(input.data_ptr<at::Half>()),
+        output.data_ptr<int8_t>(),
+        reinterpret_cast<half*>(sum_output.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(scaling.data_ptr<at::Half>()),
+        num_tokens, hidden_size);
+    } else if (elems_per_thread <= 32) {
+      QuantKernelLooped<32, SumType::kPostQuant><<<grid, block, 0, stream>>>(
+        reinterpret_cast<half*>(input.data_ptr<at::Half>()),
+        output.data_ptr<int8_t>(),
+        reinterpret_cast<half*>(sum_output.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(scaling.data_ptr<at::Half>()),
+        num_tokens, hidden_size);
+    } else {
+      QuantKernelLooped<64, SumType::kPostQuant><<<grid, block, 0, stream>>>(
+        reinterpret_cast<half*>(input.data_ptr<at::Half>()),
+        output.data_ptr<int8_t>(),
+        reinterpret_cast<half*>(sum_output.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(scaling.data_ptr<at::Half>()),
+        num_tokens, hidden_size);
+    }
   }
 
   return output;
@@ -602,13 +798,7 @@ torch::Tensor quant_sum_static(torch::Tensor &input,  // [..., hidden_size]
   int hidden_size = input.size(-1);
   int num_tokens = input.numel() / hidden_size;
 
-  assert(hidden_size <= 8192);
-
-  if (hidden_size > 4096) {
-    assert(hidden_size % 256 == 0);
-  } else {
-    assert(hidden_size % 128 == 0);
-  }
+  assert(hidden_size % 128 == 0);
 
   CHECK_SHAPE(sum_output, num_tokens);
   CHECK_SHAPE(scaling, num_tokens);
@@ -620,8 +810,20 @@ torch::Tensor quant_sum_static(torch::Tensor &input,  // [..., hidden_size]
   if (hidden_size <= 4096) {
     dim3 grid(num_tokens);
     dim3 block(hidden_size / 4);
-    
+
     QuantKernel<float2, SumType::kPostQuant, false><<<grid, block, 0, stream>>>(
+      reinterpret_cast<half*>(input.data_ptr<at::Half>()),
+      output.data_ptr<int8_t>(),
+      reinterpret_cast<half*>(sum_output.data_ptr<at::Half>()),
+      reinterpret_cast<half*>(scaling.data_ptr<at::Half>()),
+      num_tokens, hidden_size);
+  }
+  else if (hidden_size <= 8192)
+  {
+    dim3 grid(num_tokens);
+    dim3 block(hidden_size / 8);
+
+    QuantKernel<float4, SumType::kPostQuant, false><<<grid, block, 0, stream>>>(
       reinterpret_cast<half*>(input.data_ptr<at::Half>()),
       output.data_ptr<int8_t>(),
       reinterpret_cast<half*>(sum_output.data_ptr<at::Half>()),
@@ -630,15 +832,34 @@ torch::Tensor quant_sum_static(torch::Tensor &input,  // [..., hidden_size]
   }
   else
   {
+    constexpr int BLOCK_SIZE = 1024;
     dim3 grid(num_tokens);
-    dim3 block(hidden_size / 8);
-    
-    QuantKernel<float4, SumType::kPostQuant, false><<<grid, block, 0, stream>>>(
-      reinterpret_cast<half*>(input.data_ptr<at::Half>()),
-      output.data_ptr<int8_t>(),
-      reinterpret_cast<half*>(sum_output.data_ptr<at::Half>()),
-      reinterpret_cast<half*>(scaling.data_ptr<at::Half>()),
-      num_tokens, hidden_size);
+    dim3 block(BLOCK_SIZE);
+    int elems_per_thread = (hidden_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    elems_per_thread = ((elems_per_thread + 3) / 4) * 4;
+
+    if (elems_per_thread <= 16) {
+      QuantKernelLooped<16, SumType::kPostQuant, false><<<grid, block, 0, stream>>>(
+        reinterpret_cast<half*>(input.data_ptr<at::Half>()),
+        output.data_ptr<int8_t>(),
+        reinterpret_cast<half*>(sum_output.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(scaling.data_ptr<at::Half>()),
+        num_tokens, hidden_size);
+    } else if (elems_per_thread <= 32) {
+      QuantKernelLooped<32, SumType::kPostQuant, false><<<grid, block, 0, stream>>>(
+        reinterpret_cast<half*>(input.data_ptr<at::Half>()),
+        output.data_ptr<int8_t>(),
+        reinterpret_cast<half*>(sum_output.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(scaling.data_ptr<at::Half>()),
+        num_tokens, hidden_size);
+    } else {
+      QuantKernelLooped<64, SumType::kPostQuant, false><<<grid, block, 0, stream>>>(
+        reinterpret_cast<half*>(input.data_ptr<at::Half>()),
+        output.data_ptr<int8_t>(),
+        reinterpret_cast<half*>(sum_output.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(scaling.data_ptr<at::Half>()),
+        num_tokens, hidden_size);
+    }
   }
 
   return output;
@@ -663,13 +884,7 @@ torch::Tensor gelu_quant_sum(torch::Tensor &input,  // [..., hidden_size]
   int hidden_size = input.size(-1);
   int num_tokens = input.numel() / hidden_size;
 
-  assert(hidden_size <= 8192);
-
-  if (hidden_size > 4096) {
-    assert(hidden_size % 256 == 0);
-  } else {
-    assert(hidden_size % 128 == 0);
-  }
+  assert(hidden_size % 128 == 0);
 
   CHECK_SHAPE(sum_output, num_tokens);
   CHECK_SHAPE(scaling, num_tokens);
@@ -681,8 +896,20 @@ torch::Tensor gelu_quant_sum(torch::Tensor &input,  // [..., hidden_size]
   if (hidden_size <= 4096) {
     dim3 grid(num_tokens);
     dim3 block(hidden_size / 4);
-    
+
     GeluQuantFuse<float2, SumType::kPostQuant><<<grid, block, 0, stream>>>(
+      reinterpret_cast<half*>(input.data_ptr<at::Half>()),
+      output.data_ptr<int8_t>(),
+      reinterpret_cast<half*>(sum_output.data_ptr<at::Half>()),
+      reinterpret_cast<half*>(scaling.data_ptr<at::Half>()),
+      num_tokens, hidden_size);
+  }
+  else if (hidden_size <= 8192)
+  {
+    dim3 grid(num_tokens);
+    dim3 block(hidden_size / 8);
+
+    GeluQuantFuse<float4, SumType::kPostQuant><<<grid, block, 0, stream>>>(
       reinterpret_cast<half*>(input.data_ptr<at::Half>()),
       output.data_ptr<int8_t>(),
       reinterpret_cast<half*>(sum_output.data_ptr<at::Half>()),
@@ -691,15 +918,35 @@ torch::Tensor gelu_quant_sum(torch::Tensor &input,  // [..., hidden_size]
   }
   else
   {
+    // hidden_size > 8192: use looped kernel with 1024 threads
+    constexpr int BLOCK_SIZE = 1024;
     dim3 grid(num_tokens);
-    dim3 block(hidden_size / 8);
-    
-    GeluQuantFuse<float4, SumType::kPostQuant><<<grid, block, 0, stream>>>(
-      reinterpret_cast<half*>(input.data_ptr<at::Half>()),
-      output.data_ptr<int8_t>(),
-      reinterpret_cast<half*>(sum_output.data_ptr<at::Half>()),
-      reinterpret_cast<half*>(scaling.data_ptr<at::Half>()),
-      num_tokens, hidden_size);
+    dim3 block(BLOCK_SIZE);
+    int elems_per_thread = (hidden_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    elems_per_thread = ((elems_per_thread + 3) / 4) * 4;
+
+    if (elems_per_thread <= 16) {
+      GeluQuantFuseLooped<16, SumType::kPostQuant><<<grid, block, 0, stream>>>(
+        reinterpret_cast<half*>(input.data_ptr<at::Half>()),
+        output.data_ptr<int8_t>(),
+        reinterpret_cast<half*>(sum_output.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(scaling.data_ptr<at::Half>()),
+        num_tokens, hidden_size);
+    } else if (elems_per_thread <= 32) {
+      GeluQuantFuseLooped<32, SumType::kPostQuant><<<grid, block, 0, stream>>>(
+        reinterpret_cast<half*>(input.data_ptr<at::Half>()),
+        output.data_ptr<int8_t>(),
+        reinterpret_cast<half*>(sum_output.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(scaling.data_ptr<at::Half>()),
+        num_tokens, hidden_size);
+    } else {
+      GeluQuantFuseLooped<64, SumType::kPostQuant><<<grid, block, 0, stream>>>(
+        reinterpret_cast<half*>(input.data_ptr<at::Half>()),
+        output.data_ptr<int8_t>(),
+        reinterpret_cast<half*>(sum_output.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(scaling.data_ptr<at::Half>()),
+        num_tokens, hidden_size);
+    }
   }
 
   return output;
