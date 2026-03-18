@@ -265,8 +265,11 @@ class WanAttentionBlockWithCudaKernel(nn.Module):
         # Ensure QuantParams buffers match exactly B * L tokens
         total_tokens = B * L
         if self.quant_params.scale_input.numel() != total_tokens:
-            self.quant_params = QuantParams(
-                total_tokens, has_sum_input=True, device=x.device)
+            qp = QuantParams(total_tokens, has_sum_input=True, device=x.device)
+            self.quant_params = qp
+            self.self_attn.quant_params = qp
+            self.cross_attn.quant_params = qp
+            self.ffn.quant_params = qp
 
         # Compute modulation: 6 vectors of shape [B, 1, C]
         if e.dim() > 3:
