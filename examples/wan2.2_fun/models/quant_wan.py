@@ -188,8 +188,9 @@ class QuantWanModel(nn.Module):
                 clean_key = k.replace('.fp_module', '')
                 cross_attn_fp_weights[clean_key] = sd[k].clone().to(torch.float16)
 
-        # Delete fp_module, fp_weight, a_quantizer keys
-        keys_to_delete = ['fp_weight', 'fp_module', 'a_quantizer']
+        # Delete fp_module, fp_weight, a_quantizer, channel_mask, rotation_matrix keys
+        keys_to_delete = ['fp_weight', 'fp_module', 'a_quantizer',
+                          'channel_mask', 'rotation_matrix']
         for k in list(sd.keys()):
             if any(s in k for s in keys_to_delete):
                 del sd[k]

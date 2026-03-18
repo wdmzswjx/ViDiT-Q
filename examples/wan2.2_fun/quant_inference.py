@@ -138,7 +138,13 @@ def main(args):
     # Print model summary
     n_quant = sum(1 for m in model.model.modules() if isinstance(m, QuantizedLinear) and m.quant_mode)
     n_fp = sum(1 for m in model.model.modules() if isinstance(m, QuantizedLinear) and not m.quant_mode)
-    logger.info("Quantized layers: %d, FP layers: %d", n_quant, n_fp)
+    try:
+        from viditq_extension.nn.qlinear import W8A8OF16LinearDynamicInputScale
+        n_w8a8 = sum(1 for m in model.model.modules() if isinstance(m, W8A8OF16LinearDynamicInputScale))
+    except ImportError:
+        n_w8a8 = 0
+    logger.info("Quantized layers: %d (QuantizedLinear) + %d (W8A8 CUDA), FP layers: %d",
+                n_quant, n_w8a8, n_fp)
 
     # ============================================================
     # Run inference via pipeline
