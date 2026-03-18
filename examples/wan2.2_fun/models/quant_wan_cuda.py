@@ -34,6 +34,54 @@ logger = logging.getLogger(__name__)
 W8A8_CTA_M = 128
 
 
+def _qp_slices(quant_params, M):
+    """Return (sum_input[:M], scale_input[:M]) views for exact-sized kernel calls."""
+    return quant_params.sum_input[:M], quant_params.scale_input[:M]
+
+
+def _w8a8_with_padding(linear, x, quant_params):
+    """Call W8A8 linear, padding M to a multiple of CTA_M if needed.
+
+    The W8A8 GEMM kernel requires:
+      1. M (total tokens) is a multiple of W8A8_CTA_M (128)
+      2. scale_input.shape == (M,) exactly
+
+    This helper pads input + slices/pads quant_params to satisfy both
+    constraints, then slices the output back.  Padding is local to the
+    GEMM call and never leaks into attention or RoPE.
+    """
+    shape = x.shape
+    M = x.view(-1, shape[-1]).shape[0]
+    M_pad = ((M + W8A8_CTA_M - 1) // W8A8_CTA_M) * W8A8_CTA_M
+    pad = M_pad - M
+
+    # Pad input rows if needed: [M, C] → [M_pad, C]
+    x_2d = x.view(M, shape[-1])
+    if pad > 0:
+        x_2d = F.pad(x_2d, (0, 0, 0, pad))
+
+    # Build exact-sized QuantParams for the GEMM (scale_input must be (M_pad,))
+    if pad > 0:
+        scale = F.pad(quant_params.scale_input[:M], (0, pad))
+        sum_inp = F.pad(quant_params.sum_input[:M], (0, pad)) \
+            if quant_params.sum_input is not None else None
+    else:
+        # No row-padding, but still need exact shape
+        scale = quant_params.scale_input[:M]
+        sum_inp = quant_params.sum_input[:M] \
+            if quant_params.sum_input is not None else None
+
+    qp = QuantParams.__new__(QuantParams)
+    qp.has_sum_input = quant_params.has_sum_input
+    qp.scale_input = scale
+    qp.sum_input = sum_inp
+
+    out = linear(x_2d, qp)
+    if pad > 0:
+        out = out[:M]
+    return out.view(*shape[:-1], out.shape[-1])
+
+
 # ---------------------------------------------------------------------------
 # WanRMSNorm fallback (in case the user's package isn't importable here)
 # ---------------------------------------------------------------------------
@@ -105,10 +153,10 @@ class WanSelfAttentionWithCudaKernel(nn.Module):
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
-        # W8A8: INT8 input → FP16 output
-        q = self.norm_q(self.q(x, self.quant_params)).view(b, s, n, d)
-        k = self.norm_k(self.k(x, self.quant_params)).view(b, s, n, d)
-        v = self.v(x, self.quant_params).view(b, s, n, d)
+        # W8A8: INT8 input → FP16 output (with GEMM M-padding)
+        q = self.norm_q(_w8a8_with_padding(self.q, x, self.quant_params)).view(b, s, n, d)
+        k = self.norm_k(_w8a8_with_padding(self.k, x, self.quant_params)).view(b, s, n, d)
+        v = _w8a8_with_padding(self.v, x, self.quant_params).view(b, s, n, d)
 
         # RoPE + attention in FP16
         q, k = rope_apply_fn(q, k, grid_sizes, freqs)
@@ -117,9 +165,10 @@ class WanSelfAttentionWithCudaKernel(nn.Module):
         x = x.to(dtype).flatten(2)
 
         # Quantize attention output for O projection
-        x = fused_kernels.quant_sum(
-            x.contiguous(), self.quant_params.sum_input, self.quant_params.scale_input)
-        x = self.o(x, self.quant_params)
+        M = x.shape[0] * x.shape[1]
+        sum_s, scale_s = _qp_slices(self.quant_params, M)
+        x = fused_kernels.quant_sum(x.contiguous(), sum_s, scale_s)
+        x = _w8a8_with_padding(self.o, x, self.quant_params)
         return x
 
 
@@ -155,7 +204,7 @@ class WanCrossAttentionWithCudaKernel(nn.Module):
         """
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
-        q = self.norm_q(self.q(x, self.quant_params)).view(b, -1, n, d)
+        q = self.norm_q(_w8a8_with_padding(self.q, x, self.quant_params)).view(b, -1, n, d)
         k = self.norm_k(self.k(context.to(dtype))).view(b, -1, n, d)
         v = self.v(context.to(dtype)).view(b, -1, n, d)
 
@@ -164,9 +213,10 @@ class WanCrossAttentionWithCudaKernel(nn.Module):
         x = x.to(dtype).flatten(2)
 
         # Quantize attention output for O projection
-        x = fused_kernels.quant_sum(
-            x.contiguous(), self.quant_params.sum_input, self.quant_params.scale_input)
-        x = self.o(x, self.quant_params)
+        M = x.shape[0] * x.shape[1]
+        sum_s, scale_s = _qp_slices(self.quant_params, M)
+        x = fused_kernels.quant_sum(x.contiguous(), sum_s, scale_s)
+        x = _w8a8_with_padding(self.o, x, self.quant_params)
         return x
 
 
@@ -184,10 +234,11 @@ class WanFFNWithCudaKernel(nn.Module):
 
     def forward(self, x):
         """x: INT8 input from fused LayerNorm kernel, quant_params already filled."""
-        x = self.fc1(x, self.quant_params)                  # INT8 → FP16
-        x = fused_kernels.gelu_quant_sum(                   # FP16 → GELU → INT8
-            x, self.quant_params.sum_input, self.quant_params.scale_input)
-        x = self.fc2(x, self.quant_params)                  # INT8 → FP16
+        x = _w8a8_with_padding(self.fc1, x, self.quant_params)  # INT8 → FP16
+        M = x.view(-1, x.shape[-1]).shape[0]
+        sum_s, scale_s = _qp_slices(self.quant_params, M)
+        x = fused_kernels.gelu_quant_sum(x, sum_s, scale_s)     # FP16 → GELU → INT8
+        x = _w8a8_with_padding(self.fc2, x, self.quant_params)  # INT8 → FP16
         return x
 
 
@@ -255,15 +306,10 @@ class WanAttentionBlockWithCudaKernel(nn.Module):
             e = e.to(torch.float16)
             context = context.to(torch.float16)
 
-        B, L_orig, C = x.shape
+        B, L, C = x.shape
 
-        # Pad L so that B*L is a multiple of W8A8_CTA_M (128) for GEMM alignment
-        step = W8A8_CTA_M // math.gcd(B, W8A8_CTA_M)
-        L = ((L_orig + step - 1) // step) * step
-        if L != L_orig:
-            x = F.pad(x, (0, 0, 0, L - L_orig))  # zero-pad along L dim
-
-        # Ensure QuantParams buffers match exactly B * L tokens
+        # Ensure QuantParams buffers exactly match B * L tokens
+        # (fused kernels CHECK_SHAPE for exact match, not just >=)
         total_tokens = B * L
         if self.quant_params.scale_input.numel() != total_tokens:
             qp = QuantParams(total_tokens, has_sum_input=True, device=x.device)
@@ -272,7 +318,7 @@ class WanAttentionBlockWithCudaKernel(nn.Module):
             self.cross_attn.quant_params = qp
             self.ffn.quant_params = qp
 
-        # Compute modulation: 6 vectors of shape [B, 1, C]
+        # Compute modulation: 6 vectors of shape [B, 1, C] or [B, L, C]
         if e.dim() > 3:
             e = (self.modulation.unsqueeze(0) + e).chunk(6, dim=2)
             e = [ei.squeeze(2) for ei in e]
@@ -280,22 +326,18 @@ class WanAttentionBlockWithCudaKernel(nn.Module):
             e = (self.modulation + e).chunk(6, dim=1)
 
         # Helper: ensure modulation has shape [B, L, C] for fused kernels.
-        # mod may be [B, 1, C] (broadcast) or [B, L_orig, C] (per-token).
+        # mod may be [B, 1, C] (broadcast) or already [B, L, C] (per-token).
         def expand_mod(mod):
             if mod.shape[1] == 1:
                 return mod.expand(B, L, C).contiguous()
-            elif mod.shape[1] == L:
-                return mod.contiguous()
-            else:
-                # mod is [B, L_orig, C], pad to [B, L, C]
-                return F.pad(mod, (0, 0, 0, L - mod.shape[1])).contiguous()
+            return mod.contiguous()
 
         # ===== Self-Attention =====
         residual = x
         # Fused: LayerNorm(x) * (1 + scale) + shift → INT8, fills quant_params
         x = self.norm1(x.contiguous(), expand_mod(e[0]), expand_mod(e[1]),
                        self.quant_params)
-        # Self-attention with INT8 kernels
+        # Self-attention with INT8 kernels (W8A8 padding handled inside)
         x = self.self_attn(x, seq_lens, grid_sizes, freqs,
                            self.attention_fn, self.rope_apply_fn, torch.float16, t)
         # Gated residual: residual + attn_out * gate
@@ -309,9 +351,9 @@ class WanAttentionBlockWithCudaKernel(nn.Module):
         residual = x
         x_norm = self.norm3(x).to(torch.float16)
         # Quantize image features for cross-attention Q
+        sum_s, scale_s = _qp_slices(self.quant_params, B * L)
         x_quant = fused_kernels.quant_sum(
-            x_norm.contiguous(),
-            self.quant_params.sum_input, self.quant_params.scale_input)
+            x_norm.contiguous(), sum_s, scale_s)
         x = self.cross_attn(x_quant, context, context_lens,
                             self.attention_fn, torch.float16, t)
         x = residual + x
@@ -328,10 +370,6 @@ class WanAttentionBlockWithCudaKernel(nn.Module):
             expand_mod(e[5]).view(-1, C),
             residual.contiguous().view(-1, C),
         ).reshape(B, L, C)
-
-        # Remove padding tokens
-        if L != L_orig:
-            x = x[:, :L_orig, :]
 
         # Cast back to original dtype if needed
         if input_dtype != torch.float16:
