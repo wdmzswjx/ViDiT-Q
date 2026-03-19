@@ -163,7 +163,54 @@ class QuantWanModel(nn.Module):
         for param in self.model.parameters():
             param.requires_grad_(False)
 
-        # Convert all QuantizedLinear weights to INT8
+        # ── STEP 1: Save cross_attn K and V FP16 weights BEFORE INT8 conversion.
+        #
+        # These projections stay as FP16 nn.Linear in the CUDA kernel version
+        # (text context has fixed length, not per-token quantized like image features).
+        #
+        # We extract them here via named_modules traversal rather than post-hoc
+        # state-dict string matching, which is fragile and fails when:
+        #   (a) The model uses a different naming convention for K/V, or
+        #   (b) The QuantizedLinear structure differs across versions.
+        #
+        # The CUDA block (WanCrossAttentionWithCudaKernel) always names these
+        # layers "k" and "v", so we save them under "<prefix>.k.weight" etc.
+        cross_attn_fp_weights = {}
+        for full_name, submodule in self.model.named_modules():
+            name_parts = full_name.split('.')
+            # Match any module called 'k' or 'v' that lives inside a 'cross_attn'
+            if 'cross_attn' not in name_parts:
+                continue
+            if name_parts[-1] not in ('k', 'v'):
+                continue
+            # Determine the canonical key prefix the CUDA block will look for
+            # e.g. full_name = "blocks.0.cross_attn.k"
+            prefix = full_name  # already the right path
+
+            if isinstance(submodule, QuantizedLinear):
+                # fp_module holds the original FP weight (not yet INT8-ified)
+                w = submodule.fp_module.weight.detach().clone().to(torch.float16)
+                cross_attn_fp_weights[f'{prefix}.weight'] = w
+                if submodule.fp_module.bias is not None:
+                    b = submodule.fp_module.bias.detach().clone().to(torch.float16)
+                    cross_attn_fp_weights[f'{prefix}.bias'] = b
+            elif isinstance(submodule, nn.Linear):
+                # Already FP (excluded by remain_fp_regex or never quantized)
+                w = submodule.weight.detach().clone().to(torch.float16)
+                cross_attn_fp_weights[f'{prefix}.weight'] = w
+                if submodule.bias is not None:
+                    b = submodule.bias.detach().clone().to(torch.float16)
+                    cross_attn_fp_weights[f'{prefix}.bias'] = b
+
+        if cross_attn_fp_weights:
+            logger.info("Saved %d cross_attn FP16 weight tensors: %s",
+                        len(cross_attn_fp_weights),
+                        list(cross_attn_fp_weights.keys())[:6])
+        else:
+            logger.warning("No cross_attn k/v weights found — cross-attention "
+                           "will use random weights in CUDA kernel mode!")
+
+        # ── STEP 2: Convert all QuantizedLinear weights to INT8
         apply_func_to_submodules(
             self.model,
             class_type=QuantizedLinear,
@@ -173,20 +220,6 @@ class QuantWanModel(nn.Module):
 
         # Process state dict
         sd = self.model.state_dict()
-
-        # Save FP16 weights for cross_attn k and v (they stay as FP16 nn.Linear
-        # in the CUDA kernel version since text context is not per-token quantized)
-        cross_attn_fp_weights = {}
-        for k in list(sd.keys()):
-            if ('cross_attn.k.fp_module.weight' in k or
-                    'cross_attn.v.fp_module.weight' in k):
-                clean_key = k.replace('.fp_module', '')
-                cross_attn_fp_weights[clean_key] = sd[k].clone().to(torch.float16)
-            # Also save bias
-            if ('cross_attn.k.fp_module.bias' in k or
-                    'cross_attn.v.fp_module.bias' in k):
-                clean_key = k.replace('.fp_module', '')
-                cross_attn_fp_weights[clean_key] = sd[k].clone().to(torch.float16)
 
         # Delete fp_module, fp_weight, a_quantizer, channel_mask, rotation_matrix keys
         keys_to_delete = ['fp_weight', 'fp_module', 'a_quantizer',
